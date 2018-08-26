@@ -1,0 +1,7 @@
+[package]
+name = "tcpproxy"
+version = "0.1.0"
+authors = ["vizee <vizee@live.cn>"]
+
+[dependencies]
+libc = "0.2"

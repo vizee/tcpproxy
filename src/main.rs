@@ -166,7 +166,7 @@ impl IoBuf {
         let mut pfd = [0; 2];
         syscall!(libc::pipe(pfd.as_mut_ptr())).unwrap();
         IoBuf {
-            pfd: pfd,
+            pfd,
             buffered: 0,
         }
     }
@@ -362,7 +362,8 @@ fn main() {
                     PIPE_SIZE_ = n as isize;
                 };
                 ()
-            }).unwrap();
+            })
+            .unwrap();
         unsafe {
             libc::close(pfd[0]);
             libc::close(pfd[1]);
@@ -374,7 +375,8 @@ fn main() {
     syscall!(libc::epoll_create1(0))
         .map(|fd| unsafe {
             EPOLL_FD_ = fd;
-        }).unwrap();
+        })
+        .unwrap();
 
     let listen_fd = listen_tcp(&"0.0.0.0:5262".parse().unwrap()).unwrap();
     epoll_add(listen_fd, 1, 0).unwrap();
@@ -425,7 +427,7 @@ fn main() {
                 }
                 continue;
             }
-            let pd = unsafe { Box::from_raw(events[i].u64 as *mut PollDesp) };
+            let pd = unsafe { &mut *(events[i].u64 as *mut PollDesp) };
             let mut free = false;
             if events[i].events & (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLERR) as u32 != 0 {
                 let res = if pd.who == 0 {
@@ -452,7 +454,6 @@ fn main() {
             if free {
                 defer_free.push(pd.ctx.clone());
             }
-            mem::forget(pd);
         }
         for v in defer_free {
             let mut ctx = v.borrow_mut();

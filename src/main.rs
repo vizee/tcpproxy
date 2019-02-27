@@ -1,144 +1,34 @@
-extern crate libc;
+#![feature(const_string_new)]
 
-use std::cell::RefCell;
+use std::env;
 use std::mem;
-use std::net;
 use std::ptr;
 use std::rc::Rc;
 
-type SysResult<T> = Result<T, i32>;
+use crate::sys::{PipeBuf, SysResult};
 
-macro_rules! syscall {
-    ($e: expr) => {{
-        let r = unsafe { $e };
-        if r < 0 {
-            Err(unsafe { *libc::__errno_location() })
-        } else {
-            Ok(r)
-        }
-    }};
+#[macro_use]
+mod sys;
+mod net;
+
+struct Global {
+    epfd: i32,
+    backend: String,
 }
 
-fn sa_to_raw(sa: &net::SocketAddrV4) -> libc::sockaddr_in {
-    let ip = sa.ip().octets();
-    libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: sa.port().to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: (ip[3] as u32) << 24
-                | (ip[2] as u32) << 16
-                | (ip[1] as u32) << 8
-                | (ip[0] as u32),
-        },
-        ..unsafe { mem::zeroed() }
-    }
+static mut GLOBAL: Global = Global { epfd: 0, backend: String::new() };
+
+fn global() -> &'static Global {
+    return unsafe { &GLOBAL };
 }
 
-fn sa6_to_raw(sa: &net::SocketAddrV6) -> libc::sockaddr_in6 {
-    let mut inaddr: libc::in6_addr = unsafe { mem::zeroed() };
-    inaddr.s6_addr = sa.ip().octets();
-    libc::sockaddr_in6 {
-        sin6_family: libc::AF_INET6 as libc::sa_family_t,
-        sin6_port: sa.port().to_be(),
-        sin6_flowinfo: sa.flowinfo(),
-        sin6_addr: inaddr,
-        sin6_scope_id: sa.scope_id(),
-    }
-}
-
-fn connect_tcp(addr: &net::SocketAddr) -> SysResult<i32> {
-    let fd = syscall!(libc::socket(
-        match *addr {
-            net::SocketAddr::V4(_) => libc::AF_INET,
-            net::SocketAddr::V6(_) => libc::AF_INET6,
-        },
-        libc::SOCK_STREAM | libc::SOCK_NONBLOCK,
-        0,
-    ))?;
-    let r = match addr {
-        &net::SocketAddr::V4(sa) => {
-            let sin = sa_to_raw(&sa);
-            syscall!(libc::connect(
-                fd,
-                &sin as *const _ as *const _,
-                mem::size_of_val(&sin) as libc::socklen_t
-            ))
-        }
-        &net::SocketAddr::V6(sa) => {
-            let sin = sa6_to_raw(&sa);
-            syscall!(libc::connect(
-                fd,
-                &sin as *const _ as *const _,
-                mem::size_of_val(&sin) as libc::socklen_t
-            ))
-        }
-    };
-    if let Err(e) = r {
-        if e != libc::EINPROGRESS {
-            unsafe { libc::close(fd) };
-            return Err(e);
-        }
-    }
-    Ok(fd)
-}
-
-fn listen_tcp(addr: &net::SocketAddr) -> SysResult<i32> {
-    let fd = syscall!(libc::socket(
-        match *addr {
-            net::SocketAddr::V4(_) => libc::AF_INET,
-            net::SocketAddr::V6(_) => libc::AF_INET6,
-        },
-        libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-        0,
-    ))?;
-    let r = match addr {
-        &net::SocketAddr::V4(sa) => {
-            let sin = sa_to_raw(&sa);
-            syscall!(libc::bind(
-                fd,
-                &sin as *const _ as *const _,
-                mem::size_of_val(&sin) as libc::socklen_t
-            ))
-        }
-        &net::SocketAddr::V6(sa) => {
-            let sin = sa6_to_raw(&sa);
-            syscall!(libc::bind(
-                fd,
-                &sin as *const _ as *const _,
-                mem::size_of_val(&sin) as libc::socklen_t
-            ))
-        }
-    };
-    if let Err(e) = r {
-        unsafe { libc::close(fd) };
-        return Err(e);
-    }
-    let r = syscall!(libc::listen(fd, libc::SOMAXCONN));
-    if let Err(e) = r {
-        unsafe { libc::close(fd) };
-        Err(e)
-    } else {
-        Ok(fd)
-    }
-}
-
-static mut EPOLL_FD_: i32 = 0;
-static EPOLL_FD: &i32 = unsafe { &EPOLL_FD_ };
-
-fn epoll_add(fd: i32, rw: i32, data: u64) -> SysResult<i32> {
-    let mut events = libc::EPOLLET;
-    if rw & 1 != 0 {
-        events |= libc::EPOLLIN;
-    }
-    if rw & 2 != 0 {
-        events |= libc::EPOLLOUT;
-    }
+fn epoll_add(fd: i32, events: i32, data: u64) -> SysResult<i32> {
     syscall!(libc::epoll_ctl(
-        *EPOLL_FD,
+        global().epfd,
         libc::EPOLL_CTL_ADD,
         fd,
         &libc::epoll_event {
-            events: events as u32,
+            events: (libc::EPOLLET | events) as u32,
             u64: data
         } as *const _ as *mut _,
     ))
@@ -146,121 +36,38 @@ fn epoll_add(fd: i32, rw: i32, data: u64) -> SysResult<i32> {
 
 fn epoll_del(fd: i32) -> SysResult<i32> {
     syscall!(libc::epoll_ctl(
-        *EPOLL_FD,
+        global().epfd,
         libc::EPOLL_CTL_DEL,
         fd,
         ptr::null_mut(),
     ))
 }
 
-static mut PIPE_SIZE_: isize = 0;
-static PIPE_SIZE: &isize = unsafe { &PIPE_SIZE_ };
-
-struct IoBuf {
-    pfd: [i32; 2],
-    buffered: isize,
-}
-
-impl IoBuf {
-    fn new() -> IoBuf {
-        let mut pfd = [0; 2];
-        syscall!(libc::pipe(pfd.as_mut_ptr())).unwrap();
-        IoBuf {
-            pfd,
-            buffered: 0,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.buffered == 0
-    }
-
-    fn splice_in(&mut self, fd: i32) -> SysResult<bool> {
-        let max_size = *PIPE_SIZE;
-        while self.buffered < max_size {
-            let r = syscall!(libc::splice(
-                fd,
-                ptr::null_mut(),
-                self.pfd[1],
-                ptr::null_mut(),
-                (max_size - self.buffered) as usize,
-                libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK
-            ));
-            let n = match r {
-                Ok(n) => n,
-                Err(e) => {
-                    if e == libc::EAGAIN {
-                        break;
-                    }
-                    return Err(e);
-                }
-            };
-            if n == 0 {
-                return Ok(true);
-            }
-            self.buffered += n;
-        }
-        Ok(false)
-    }
-
-    fn splice_out(&mut self, fd: i32) -> SysResult<()> {
-        while self.buffered > 0 {
-            let r = syscall!(libc::splice(
-                self.pfd[0],
-                ptr::null_mut(),
-                fd,
-                ptr::null_mut(),
-                self.buffered as usize,
-                libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK
-            ));
-            let n = match r {
-                Ok(n) => n,
-                Err(e) => {
-                    if e == libc::EAGAIN {
-                        break;
-                    }
-                    return Err(e);
-                }
-            };
-            self.buffered -= n;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for IoBuf {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.pfd[0]);
-            libc::close(self.pfd[1]);
-        }
-    }
-}
-
 struct Context {
     bad: bool,
     client_fd: i32,
     backend_fd: i32,
-    in_buf: IoBuf,
-    out_buf: IoBuf,
+    in_buf: PipeBuf,
+    out_buf: PipeBuf,
     in_pd: u64,
     out_pd: u64,
 }
 
 impl Context {
     fn new(client_fd: i32, backend_fd: i32) -> Context {
+        println!("Context::new: {}+{}", client_fd, backend_fd);
         Context {
             bad: false,
             client_fd,
             backend_fd,
-            in_buf: IoBuf::new(),
-            out_buf: IoBuf::new(),
+            in_buf: PipeBuf::new(),
+            out_buf: PipeBuf::new(),
             in_pd: 0,
             out_pd: 0,
         }
     }
 
-    fn copy(buf: &mut IoBuf, from_fd: i32, to_fd: i32) -> SysResult<()> {
+    fn copy(buf: &mut PipeBuf, from_fd: i32, to_fd: i32) -> SysResult<()> {
         let eof = buf.splice_in(from_fd)?;
         if !buf.is_empty() {
             buf.splice_out(to_fd)?;
@@ -309,19 +116,30 @@ impl Drop for Context {
     }
 }
 
-struct PollDesp {
-    who: i32,
-    ctx: Rc<RefCell<Context>>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    Client,
+    Backend,
 }
 
-impl Drop for PollDesp {
-    fn drop(&mut self) {
-        println!("PollDesp drop: {}", self.who);
-    }
+struct PollDesp {
+    who: Owner,
+    ctx: Rc<Context>,
+}
+
+#[inline]
+fn mutable<T, F, R>(x: &Rc<T>, f: F) -> R
+    where
+        T: ?Sized,
+        F: Fn(&mut T) -> R,
+{
+    f(unsafe { &mut *(&**x as *const _ as *mut T) })
 }
 
 fn handle_client(client_fd: i32) {
-    let res = connect_tcp(&"127.0.0.1:9527".parse().unwrap());
+    let ba = net::resolve_first(&global().backend, libc::AF_INET, libc::SOCK_STREAM, false)
+        .expect("bad address");
+    let res = net::connect_tcp(&ba);
     let backend_fd = match res {
         Ok(fd) => fd,
         Err(e) => {
@@ -334,60 +152,80 @@ fn handle_client(client_fd: i32) {
         "associate client_fd {} backend_fd {}",
         client_fd, backend_fd
     );
-    let ctx = Rc::new(RefCell::new(Context::new(client_fd, backend_fd)));
-    {
-        let in_pd = Box::into_raw(Box::new(PollDesp {
-            who: 0,
-            ctx: ctx.clone(),
-        })) as u64;
-        let out_pd = Box::into_raw(Box::new(PollDesp {
-            who: 1,
-            ctx: ctx.clone(),
-        })) as u64;
-        let mut ctx = ctx.borrow_mut();
+    let ctx = Rc::new(Context::new(client_fd, backend_fd));
+    let in_pd = Box::into_raw(Box::new(PollDesp {
+        who: Owner::Client,
+        ctx: ctx.clone(),
+    })) as u64;
+    let out_pd = Box::into_raw(Box::new(PollDesp {
+        who: Owner::Backend,
+        ctx: ctx.clone(),
+    })) as u64;
+    mutable(&ctx, |ctx| {
         ctx.in_pd = in_pd;
         ctx.out_pd = out_pd;
-        epoll_add(client_fd, 3, in_pd).unwrap();
-        epoll_add(backend_fd, 3, out_pd).unwrap();
+    });
+    epoll_add(client_fd, libc::EPOLLIN | libc::EPOLLOUT, in_pd).unwrap();
+    epoll_add(backend_fd, libc::EPOLLIN | libc::EPOLLOUT, out_pd).unwrap();
+}
+
+struct Config {
+    listen: String,
+    dst: String,
+}
+
+fn parse_args() -> Result<Config, &'static str> {
+    let mut config = Config {
+        listen: ":8080".to_string(),
+        dst: "127.0.0.1:9090".to_string(),
+    };
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-l" => if let Some(listen) = args.next() {
+                config.listen = listen;
+            } else {
+                return Err("missing argument for -l");
+            },
+            "-d" => if let Some(dst) = args.next() {
+                config.dst = dst;
+            } else {
+                return Err("missing argument for -d");
+            }
+            _ => {
+                println!("tcpproxy [-l <listen>] [-d <backend>]");
+                ::std::process::exit(1);
+            },
+        }
     }
+    Ok(config)
 }
 
 fn main() {
-    {
-        let mut pfd = [0; 2];
-        syscall!(libc::pipe(pfd.as_mut_ptr())).unwrap();
-        syscall!(libc::fcntl(pfd[0], libc::F_GETPIPE_SZ))
-            .map(|n| {
-                unsafe {
-                    PIPE_SIZE_ = n as isize;
-                };
-                ()
-            })
-            .unwrap();
-        unsafe {
-            libc::close(pfd[0]);
-            libc::close(pfd[1]);
-        }
-
-        println!("pipe size: {}", *PIPE_SIZE);
+    let config = parse_args().expect("invalid option");
+    unsafe {
+        GLOBAL.backend = config.dst;
     }
+
+    sys::init().unwrap();
 
     syscall!(libc::epoll_create1(0))
         .map(|fd| unsafe {
-            EPOLL_FD_ = fd;
+            GLOBAL.epfd = fd;
         })
-        .unwrap();
+        .expect("epoll_create failed");
 
-    let listen_fd = listen_tcp(&"0.0.0.0:5262".parse().unwrap()).unwrap();
-    epoll_add(listen_fd, 1, 0).unwrap();
-
-    println!("listen ok");
+    println!("listen {}", config.listen);
+    let la = net::resolve_first(&config.listen, libc::AF_INET, libc::SOCK_STREAM, true)
+        .expect("bad address");
+    let listen_fd = net::listen_tcp(&la)
+        .expect("listen failed");
+    epoll_add(listen_fd, libc::EPOLLIN, 0).unwrap();
 
     let mut events: [libc::epoll_event; 64] = unsafe { mem::zeroed() };
     loop {
-        println!("polling events");
         let res = syscall!(libc::epoll_wait(
-            *EPOLL_FD,
+            global().epfd,
             events.as_mut_ptr(),
             events.len() as i32,
             -1
@@ -401,8 +239,7 @@ fn main() {
                 panic!("epoll_wait failed: {}", e);
             }
         };
-        println!("epoll {} events raised", n);
-        let mut defer_free = Vec::new();
+        let mut unused = Vec::new();
         for i in 0..n as usize {
             if events[i].u64 == 0 {
                 loop {
@@ -427,13 +264,13 @@ fn main() {
                 }
                 continue;
             }
-            let pd = unsafe { &mut *(events[i].u64 as *mut PollDesp) };
+            let pd = unsafe { &*(events[i].u64 as *mut PollDesp) };
             let mut free = false;
-            if events[i].events & (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLERR) as u32 != 0 {
-                let res = if pd.who == 0 {
-                    pd.ctx.borrow_mut().copy_from()
+            if events[i].events & (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLRDHUP) as u32 != 0 {
+                let res = if pd.who == Owner::Client {
+                    mutable(&pd.ctx, |ctx| ctx.copy_from())
                 } else {
-                    pd.ctx.borrow_mut().copy_to()
+                    mutable(&pd.ctx, |ctx| ctx.copy_to())
                 };
                 if let Err(e) = res {
                     println!("copy data failed on IN: {}", e);
@@ -441,10 +278,10 @@ fn main() {
                 }
             }
             if events[i].events & (libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0 {
-                let res = if pd.who == 1 {
-                    pd.ctx.borrow_mut().copy_from()
+                let res = if pd.who == Owner::Backend {
+                    mutable(&pd.ctx, |ctx| ctx.copy_from())
                 } else {
-                    pd.ctx.borrow_mut().copy_to()
+                    mutable(&pd.ctx, |ctx| ctx.copy_to())
                 };
                 if let Err(e) = res {
                     println!("copy data failed on OUT: {}", e);
@@ -452,12 +289,11 @@ fn main() {
                 }
             }
             if free {
-                defer_free.push(pd.ctx.clone());
+                unused.push(pd.ctx.clone());
             }
         }
-        for v in defer_free {
-            let mut ctx = v.borrow_mut();
-            ctx.shutdown();
+        for ctx in unused {
+            mutable(&ctx, |ctx| ctx.shutdown());
         }
     }
 }

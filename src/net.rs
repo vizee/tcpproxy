@@ -67,13 +67,15 @@ pub fn resolve_address<F>(host: Option<&str>, port: &str, af: i32, socktype: i32
         }
         it = ai.ai_next;
     }
-    unsafe { libc::freeaddrinfo(res); }
+    unsafe { libc::freeaddrinfo(res) };
     Ok(())
 }
 
 pub fn resolve_first(addr: &str, af: i32, socktype: i32, passive: bool) -> Result<net::SocketAddr, String> {
     let mut part = addr.splitn(2, ':');
-    let host = part.next().and_then(|s| if s.is_empty() { None } else { Some(s) });
+    let host = part
+        .next()
+        .and_then(|s| if s.is_empty() { None } else { Some(s) });
     let port = if let Some(s) = part.next() {
         s
     } else {

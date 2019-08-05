@@ -16,7 +16,10 @@ struct Global {
     backend: String,
 }
 
-static mut GLOBAL: Global = Global { epfd: 0, backend: String::new() };
+static mut GLOBAL: Global = Global {
+    epfd: 0,
+    backend: String::new(),
+};
 
 fn global() -> &'static Global {
     return unsafe { &GLOBAL };
@@ -182,27 +185,29 @@ fn parse_args() -> Result<Config, &'static str> {
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-l" => if let Some(listen) = args.next() {
-                config.listen = listen;
-            } else {
-                return Err("missing argument for -l");
-            },
-            "-d" => if let Some(dst) = args.next() {
-                config.dst = dst;
-            } else {
-                return Err("missing argument for -d");
+            "-l" => {
+                if let Some(listen) = args.next() {
+                    config.listen = listen;
+                } else {
+                    return Err("missing argument for -l");
+                }
             }
-            _ => {
-                println!("tcpproxy [-l <listen>] [-d <backend>]");
-                ::std::process::exit(1);
-            },
+            "-d" => {
+                if let Some(dst) = args.next() {
+                    config.dst = dst;
+                } else {
+                    return Err("missing argument for -d");
+                }
+            }
+            _ => return Err("tcpproxy [-l <listen>] [-d <backend>]"),
         }
     }
     Ok(config)
 }
 
 fn main() {
-    let config = parse_args().expect("invalid option");
+    let config = parse_args()
+        .expect("invalid option");
     unsafe {
         GLOBAL.backend = config.dst;
     }
